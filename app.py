@@ -356,6 +356,18 @@ def intraday_stats(df: pd.DataFrame, days_back: int = 20):
     }
 
 
+def stage_of(pct) -> str:
+    if pct is None:
+        return "단계 불명"
+    if pct < -20:
+        return "급락 중"
+    if pct <= 20:
+        return "급등 전 가능"
+    if pct <= 60:
+        return "상승 진행 중"
+    return "이미 급등"
+
+
 def score_signal(s: dict, mcap, price) -> tuple[float, dict, float | None]:
     """0~100 점수. 급등 '전' 단계(거래량 선행, 가격 초기)에 가점."""
     parts = {}
@@ -396,7 +408,13 @@ def score_signal(s: dict, mcap, price) -> tuple[float, dict, float | None]:
     t3 = s.get("trend3")
     parts["수급 변화"] = min(max((t3 or 1) - 1, 0) / 1.5, 1.0) * 10
 
-    return round(min(sum(parts.values()), 100), 1), parts, shares
+    total = min(sum(parts.values()), 100)
+    if p is not None:
+        if p > 60:
+            total = min(total, 55)      # 이미 급등한 종목은 A/B 등급 제외
+        elif p < -20:
+            total = min(total, 40)      # 급락 종목은 급등 전 후보가 아님
+    return round(total, 1), parts, shares
 
 
 # ----------------------------------------------------------------------------
@@ -666,12 +684,14 @@ def run_scan(cfg: Config, progress=None):
 
     # SEC 간이 점검: 상위 종목만 (제출 목록 1회 호출)
     df["risk"] = 0
+    df["sec_err"] = ""
     top = df.head(cfg.sec_top)
     for i, (idx, r) in enumerate(top.iterrows()):
         if progress:
             progress(0.7 + 0.3 * (i + 1) / len(top), f"SEC 점검 {i + 1}/{len(top)}")
         f = forensics(r.symbol, deep=False, mcap=r.mcap)
         df.loc[idx, "risk"] = f["risk"]
+        df.loc[idx, "sec_err"] = f["error"] or ""
     df["final"] = (df.signal - df.risk * 0.4).clip(lower=0).round(1)
     df["grade"] = df.final.map(grade_of)
     df = df.sort_values("final", ascending=False).reset_index(drop=True)
@@ -720,13 +740,18 @@ def fmt_alert(r: dict, f: dict | None = None) -> str:
     icon = {"A": "🔴", "B": "🟠", "C": "🟡"}.get(r["grade"], "⚪")
     esc = htmllib.escape
     pct = r["pct"]
+    risk_txt = "희석위험 확인불가" if r.get("sec_err") else f"희석위험 {r['risk']:.0f}"
     lines = [
         f"{icon} <b>{esc(r['symbol'])}</b> · 등급 {r['grade']} · 최종 {r['final']:.0f}점",
         f"{esc(str(r['name']))[:40]} ({esc(r['exchange'])})",
-        f"가격 ${r['price']:.2f}" + (f" ({pct:+.1f}%)" if pct is not None else ""),
-        f"시간대 거래량 {r['rvol_tod']:.1f}배 · 시그널 {r['signal']:.0f} · 희석위험 {r['risk']:.0f}"
-        if r["rvol_tod"] else f"시그널 {r['signal']:.0f} · 희석위험 {r['risk']:.0f}",
+        f"가격 ${r['price']:.2f}" + (f" ({pct:+.1f}%)" if pct is not None else "") + f" · {stage_of(pct)}",
+        f"시간대 거래량 {r['rvol_tod']:.1f}배 · 시그널 {r['signal']:.0f} · {risk_txt}"
+        if r["rvol_tod"] else f"시그널 {r['signal']:.0f} · {risk_txt}",
     ]
+    if r.get("sec_err"):
+        lines.append(f"⚠️ SEC 조회 실패: {esc(str(r['sec_err'])[:80])}")
+    if r["price"] < 1:
+        lines.append("⚠️ $1 미만: 상장 유지·희석 위험 큼")
     if f:
         for label, pts, src in f["flags"][:6]:
             lines.append(f"• {esc(label)} (+{pts}) — {esc(src)}")
@@ -748,7 +773,10 @@ def send_alerts(df: pd.DataFrame, cfg: Config) -> list[str]:
             continue
         rd = r.to_dict()
         f = forensics(r.symbol, deep=True, mcap=r.mcap) if cfg.deep_alert else None
-        if f:
+        if f and f["error"]:
+            rd["sec_err"] = f["error"]
+        if f and not f["error"]:
+            rd["sec_err"] = ""
             rd["risk"] = f["risk"]
             rd["final"] = round(max(0, rd["signal"] - f["risk"] * 0.4), 1)
             rd["grade"] = grade_of(rd["final"])
